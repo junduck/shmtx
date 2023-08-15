@@ -7,186 +7,262 @@
 #include <new>
 #include <thread>
 
-#include <boost/predef.h>
-#if BOOST_ARCH_X86 || BOOST_ARCH_X86_64
+#define SHMTX_ARCH_X86 0
+#define SHMTX_ARCH_ARM 0
+
+#if defined(__i386__) || defined(__x86_64__)
+#undef SHMTX_ARCH_X86
+#define SHMTX_ARCH_X86 1
+#elif defined(__arm__) || defined(__aarch64__)
+#undef SHMTX_ARCH_ARM
+#define SHMTX_ARCH_ARM 1
+#endif
+
+#define SHMTX_OS_MACOS 0
+#if defined(__APPLE__) && !defined(TARGET_OS_IOS)
+#undef SHMTX_OS_MACOS
+#define SHMTX_OS_MACOS 1
+#endif
+
+#define SHMTX_COMP_GCC 0
+#if defined(__GNUC__) && !defined(__clang__)
+#undef SHMTX_COMP_GCC
+#define SHMTX_COMP_GCC __GNUC__
+#endif
+
+#if SHMTX_ARCH_X86
 #include <emmintrin.h>
-#elif BOOST_ARCH_ARM || BOOST_ARCH_ARM64
+#elif SHMTX_ARCH_ARM && !SHMTX_COMP_GCC
 #include <arm_acle.h>
 #endif
 
-#if !defined(SHMTX_MAXSPIN)
-#define SHMTX_MAXSPIN 32
+// app defines
+
+#if !defined(SHMTX_SPIN_RETRY)
+#define SHMTX_SPIN_RETRY 0
+#endif
+
+#if !defined(SHMTX_CACHELINE_SIZE)
+#define SHMTX_CACHELINE_SIZE 0
 #endif
 
 namespace shmtx {
 
 namespace arch {
-
-#if BOOST_ARCH_X86 || BOOST_ARCH_X86_64
+#if SHMTX_ARCH_X86
 inline void spin_pause() { _mm_pause(); }
-#elif BOOST_ARCH_ARM || BOOST_ARCH_ARM64
-#if BOOST_COMP_GNUC
-// GCC does not provide __yield() in arm_acle.h
+#elif SHMTX_ARCH_ARM
+#if SHMTX_COMP_GCC
 inline void spin_pause() { asm volatile("yield" ::: "memory"); }
 #else
 inline void spin_pause() { __yield(); }
-#endif // BOOST_COMP_GNUC
+#endif
 #else
 inline void spin_pause() {}
-#endif // BOOST_ARCH_X86 || BOOST_ARCH_X86_64
+#endif
 
-// implementing spinlock in userland is a bad idea,
-// let's relax it a little bit and hope for the best
-inline void spin_relax(int &nspin) {
-  if (nspin++ == SHMTX_MAXSPIN) {
-    nspin = 0;
+#if SHMTX_SPIN_RETRY
+constexpr inline int spin_retry = SHMTX_SPIN_RETRY;
+#else
+constexpr inline int spin_retry = 64;
+#endif
+
+template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+void spin_relax(T &n, int yield = spin_retry) {
+  if (n++ > yield) {
+    n = T{};
     std::this_thread::sleep_for(std::chrono::nanoseconds(1));
   }
   spin_pause();
 }
 
-#if defined(SHMTX_CACHELINE)
-constexpr size_t cacheline = SHMTX_CACHELINE;
+#if SHMTX_CACHELINE_SIZE
+constexpr inline size_t cacheline = SHMTX_CACHELINE_SIZE;
+#elif SHMTX_OS_MACOS && SHMTX_ARCH_ARM
+// Overwrite for Apple Silicon: GCC somehow reports 256
+// std::hardware_destructive_interference_size
+constexpr inline size_t cacheline = 128;
 #elif defined(__cpp_lib_hardware_interference_size)
-constexpr size_t cacheline = std::hardware_destructive_interference_size;
+constexpr inline size_t cacheline = std::hardware_destructive_interference_size;
 #else
-constexpr size_t cacheline = 64;
-#endif // SHMTX_CACHELINE
-
+constexpr inline size_t cacheline = 64;
+#endif
 } // namespace arch
 
 namespace detail {
+struct alignas(arch::cacheline) shmtx_slot {
+  constexpr static size_t write = size_t(1) << (sizeof(size_t) * 8 - 1);
+  constexpr static size_t write_clear = ~write;
+  std::atomic<size_t> state;
 
-template <size_t N> class shmtx_impl {
-  struct alignas(arch::cacheline) state_t {
-    // Highest bit is reserved to hold exclusive lock so in theory we can have
-    // 2^63 shared locks per slot in a 64-bit system
-    constexpr static size_t exclusive = size_t(1) << (sizeof(size_t) * 8 - 1);
-    constexpr static size_t unlocked = size_t(0);
-    std::atomic<size_t> state;
-  };
+  size_t get() const noexcept { return state.load(std::memory_order_relaxed); }
+  size_t acq() const noexcept { return state.load(std::memory_order_acquire); }
 
-  std::array<state_t, N> slot{};
-  auto get_state(size_t idx) -> std::atomic<size_t> & {
-    return slot[idx].state;
+  // write_enter/leave are NOT sync points:
+  void write_enter() noexcept {
+    state.fetch_or(write, std::memory_order_relaxed);
+  }
+  void write_leave() noexcept {
+    state.fetch_and(write_clear, std::memory_order_relaxed);
   }
 
-public:
-  constexpr shmtx_impl() = default;
-  ~shmtx_impl() = default;
+  void pub(size_t st = 0) noexcept {
+    state.store(st, std::memory_order_release);
+  }
+  void dec() noexcept { state.fetch_sub(1, std::memory_order_release); }
+  bool cas(size_t &observed, size_t desired) noexcept {
+    return state.compare_exchange_weak(observed, desired,
+                                       std::memory_order_acquire,
+                                       std::memory_order_relaxed);
+  }
+  size_t xchg(size_t val) noexcept {
+    return state.exchange(val, std::memory_order_acquire);
+  }
+};
 
-  // shared lock
+struct shmtx_impl {
+  template <typename Iter> static void wlock(Iter slot) noexcept {
+    auto retry = 0;
+    while (slot->xchg(1)) // acq
+      arch::spin_relax(retry);
+  }
 
-  // when locking shared, we only need to spin on owned slot
-  void lock_slot_shared(size_t idx) noexcept {
+  template <typename Iter> static bool try_wlock(Iter slot) noexcept {
+    size_t expected = 0;
+    return slot->cas(expected, 1); // acq
+  }
+
+  template <typename Iter> static void wunlock(Iter slot) noexcept {
+    slot->pub(0); // rel
+  }
+
+  template <typename Iter> static void lock_sh(Iter slot) noexcept {
     auto retry = 0;
     while (true) {
-      auto state = get_state(idx).load(std::memory_order_relaxed);
-      // exclusive lock is held on this slot, now spin
-      if (state == state_t::exclusive) {
+      auto state = slot->get();
+      if (state & shmtx_slot::write) {
         arch::spin_relax(retry);
-        continue;
-      }
-      // An exclusive lock could be acquired during this gap
-      // so we will need to reload the state if CAS fails
-      if (get_state(idx).compare_exchange_weak(state, state + 1,
-                                               std::memory_order_acquire,
-                                               std::memory_order_relaxed)) {
+      } else if (slot->cas(state, state + 1)) {
+        // acq
         break;
       }
     }
   }
 
-  void unlock_slot_shared(size_t idx) noexcept {
-    // since shared lock is held, we can just decrement shared count
-    // there is no sanity check here, it's the caller's responsibility
-    // to make sure the correct lock is held on the correct slot
-    get_state(idx).fetch_sub(1, std::memory_order_release);
-  }
-
-  bool try_lock_slot_shared(size_t idx) noexcept {
-    auto state = get_state(idx).load(std::memory_order_relaxed);
-    // exclusive lock is held on this slot, can't acquire shared lock
-    if (state == state_t::exclusive) {
+  template <typename Iter> static bool trylock_sh(Iter slot) noexcept {
+    auto state = slot->get();
+    if (state & shmtx_slot::write) {
       return false;
+    } else {
+      return slot->cas(state, state + 1); // acq
     }
-    // we could spuriously fail here but that's how try_lock works right?
-    return get_state(idx).compare_exchange_weak(
-        state, state + 1, std::memory_order_acquire, std::memory_order_relaxed);
   }
 
-  // exclusive lock
+  template <typename Iter> static void unlock_sh(Iter slot) noexcept {
+    slot->dec(); // rel
+  }
 
-  // when locking exclusively, we need to spin on all slots
-  void lock_exclusive() noexcept {
-    for (size_t i = 0; i < N; ++i) {
-      auto retry = 0;
-      while (true) {
-        auto state = get_state(i).load(std::memory_order_relaxed);
-        // A shared or exclusive lock is held on this slot, now spin
-        if (state) {
-          arch::spin_relax(retry);
-          continue;
-        }
-        // A lock could be acquired in this gap
-        // we will need to reload the state if CAS fails
-        if (get_state(i).compare_exchange_weak(state, state_t::exclusive,
-                                               std::memory_order_acquire,
-                                               std::memory_order_relaxed)) {
-          break;
-        }
+  template <typename Iter> static void lock_ex(Iter first, Iter last) noexcept {
+    wlock(last);
+    for (auto slot = first; slot != last; ++slot) {
+      slot->write_enter(); // nosync
+    }
+    auto retry = 0;
+    for (auto slot = first; slot != last; ++slot) {
+      while (slot->acq() != shmtx_slot::write) {
+        // acq
+        arch::spin_relax(retry);
       }
     }
   }
 
-  void unlock_exclusive() noexcept {
-    for (size_t i = N; i--;) {
-      // since this is an exclusive lock, we can just set the state to
-      // state_t::unlocked
-      get_state(i).store(state_t::unlocked, std::memory_order_release);
+  template <typename Iter>
+  static bool trylock_ex(Iter first, Iter last) noexcept {
+    if (!try_wlock(last))
+      return false;
+    for (auto slot = first; slot != last; ++slot) {
+      slot->write_enter(); // nosync
     }
-  }
-
-  bool try_lock_exclusive() noexcept {
-    for (size_t i = 0; i < N; ++i) {
-      auto state = get_state(i).load(std::memory_order_relaxed);
-      if (state) {
-        // we can't acquire a lock on this slot, unlock all the locks we
-        // previously acquired before returning
+    for (auto slot = first; slot != last; ++slot) {
+      if (slot->acq() != shmtx_slot::write) {
+        // acq
         goto FAILED_UNLOCK;
       }
-      if (get_state(i).compare_exchange_weak(state, state_t::exclusive,
-                                             std::memory_order_acquire,
-                                             std::memory_order_relaxed)) {
-        continue;
+    }
+    return true;
+  FAILED_UNLOCK:
+    for (auto slot = first; slot != last; ++slot)
+      slot->write_leave(); // nosync
+    wunlock(last);         // rel
+    return false;
+  }
+
+  template <typename Iter>
+  static void unlock_ex(Iter first, Iter last) noexcept {
+    for (auto slot = first; slot != last; ++slot)
+      slot->pub(0); // rel
+    wunlock(last);
+  }
+
+  template <typename Iter>
+  static void upgrade_sh(Iter first, Iter last, Iter hold) noexcept {
+    wlock(last);
+    unlock_sh(hold);
+    for (auto slot = first; slot != last; ++slot) {
+      slot->write_enter();
+    }
+    auto retry = 0;
+    for (auto slot = first; slot != last; ++slot) {
+      while (slot->acq() != shmtx_slot::write) {
+        arch::spin_relax(retry);
       }
-      // CAS failed, unlock all the locks we previously acquired before
-      // returning
-    FAILED_UNLOCK:
-      for (size_t j = i; j--;) {
-        get_state(j).store(state_t::unlocked, std::memory_order_release);
-      }
+    }
+  }
+
+  template <typename Iter>
+  static void downgrade_ex(Iter first, Iter last, Iter hold) noexcept {
+    for (auto slot = first; slot != last; ++slot)
+      if (slot == hold)
+        slot->pub(1);
+      else
+        slot->pub(0);
+    wunlock(last);
+  }
+
+  // NOTE: try_upgrade_sh will most likely to fail and starve writer,
+  // split to multiple stages for finer grained control.
+
+  // try to acquire write lock then block new readers
+  template <typename Iter>
+  static bool prepare_upgrade(Iter first, Iter last) noexcept {
+    if (!try_wlock(last))
       return false;
+    for (auto slot = first; slot != last; ++slot) {
+      slot->write_enter();
     }
     return true;
   }
+
+  // try to acquire exclusive lock
+  template <typename Iter>
+  static bool commit_upgrade(Iter first, Iter last, Iter hold) noexcept {
+    for (auto slot = first; slot != last; ++slot) {
+      auto state = slot->acq();
+      if ((slot == hold && state != (shmtx_slot::write + 1)) ||
+          (slot != hold && state != shmtx_slot::write))
+        return false;
+    }
+    return true;
+  }
+
+  // abort upgrade, unblock readers
+  template <typename Iter>
+  static void abort_upgrade(Iter first, Iter last) noexcept {
+    for (auto slot = first; slot != last; ++slot)
+      slot->write_leave();
+    wunlock(last);
+  }
 };
-
-// check power of 2
-constexpr bool is_pow2(size_t n) { return n && ((n & (n - 1)) == 0); }
-
-// round up to the next power of 2
-constexpr size_t roundup_pow2(size_t n) {
-  if (is_pow2(n)) {
-    return n;
-  }
-  size_t i = 1;
-  while (i < n) {
-    i <<= 1;
-  }
-  return i;
-}
-
 } // namespace detail
 
 /**
@@ -201,8 +277,8 @@ constexpr size_t roundup_pow2(size_t n) {
  *
  * @tparam N number of slots to reduce contention
  */
-template <size_t N> class shared_mutex {
-  detail::shmtx_impl<N> impl{};
+template <size_t N> class shared_mutex : private detail::shmtx_impl {
+  std::array<detail::shmtx_slot, N + 1> slots{};
   static std::atomic<size_t> nthread;
   // this thread's slot index
   static size_t my_idx() {
@@ -215,83 +291,74 @@ template <size_t N> class shared_mutex {
 
 public:
   constexpr shared_mutex() = default;
-  ~shared_mutex() = default;
-
-  // non-copyable
-  shared_mutex(const shared_mutex &) = delete;
-  shared_mutex &operator=(const shared_mutex &) = delete;
 
   // shared lock
-  void lock_shared() noexcept { impl.lock_slot_shared(my_idx()); }
-  void unlock_shared() noexcept { impl.unlock_slot_shared(my_idx()); }
+  void lock_shared() noexcept { this->lock_sh(slots.data() + my_idx()); }
+  void unlock_shared() noexcept { this->unlock_sh(slots.data() + my_idx()); }
   bool try_lock_shared() noexcept {
-    return impl.try_lock_slot_shared(my_idx());
+    return this->trylock_sh(slots.data() + my_idx());
   }
 
   // exclusive lock
-  void lock() noexcept { impl.lock_exclusive(); }
-  void unlock() noexcept { impl.unlock_exclusive(); }
-  bool try_lock() noexcept { return impl.try_lock_exclusive(); }
+  void lock() noexcept { this->lock_ex(slots.data(), slots.data() + N); }
+  void unlock() noexcept { this->unlock_ex(slots.data(), slots.data() + N); }
+  bool try_lock() noexcept {
+    return this->trylock_ex(slots.data(), slots.data() + N);
+  }
+
+  // upgrade lock
+  void upgrade() noexcept {
+    this->upgrade_sh(slots.data(), slots.data() + N, slots.data() + my_idx());
+  }
+
+  // downgrade lock
+  void downgrade() noexcept {
+    this->downgrade_ex(slots.data(), slots.data() + N, slots.data() + my_idx());
+  }
 };
 
 template <size_t N> std::atomic<size_t> shared_mutex<N>::nthread{0};
 
-/**
- * @brief A shared mutex pool
- *
- * @tparam N number of slots to reduce contention
- */
-template <size_t N> class shared_mutex_pool {
-  constexpr static size_t nslot = detail::roundup_pow2(N);
-  std::shared_ptr<detail::shmtx_impl<nslot>> impl =
-      std::make_shared<detail::shmtx_impl<nslot>>();
-  std::atomic<size_t> next_slot{0};
-
-  // round robin slot allocation
-  size_t request_slot() {
-    return next_slot.fetch_add(1, std::memory_order_relaxed) & (nslot - 1);
+class shared_mutex_mgr {
+  unsigned n;
+  std::atomic<unsigned> next;
+  std::unique_ptr<detail::shmtx_slot[]> slot;
+  unsigned next_index() noexcept {
+    return next.fetch_add(1, std::memory_order_relaxed) % n;
   }
 
 public:
-  class worker_mutex {
-    friend class shared_mutex_pool;
+  class [[nodiscard]] mutex_type final : private detail::shmtx_impl {
+    friend class shared_mutex_mgr;
+    unsigned n, id;
+    detail::shmtx_slot *base;
 
-    std::shared_ptr<detail::shmtx_impl<nslot>> impl;
-    size_t idx;
-
-    worker_mutex() = default;
+    mutex_type(size_t n, size_t id, detail::shmtx_slot *base) noexcept
+        : n(n), id(id), base(base) {}
 
   public:
-    ~worker_mutex() = default;
+    void lock_shared() noexcept { this->lock_sh(base + id); }
+    void unlock_shared() noexcept { this->unlock_sh(base + id); }
+    bool try_lock_shared() noexcept { return this->trylock_sh(base + id); }
 
-    // shared lock
-    void lock_shared() noexcept { impl->lock_slot_shared(idx); }
-    void unlock_shared() noexcept { impl->unlock_slot_shared(idx); }
-    bool try_lock_shared() noexcept { return impl->try_lock_slot_shared(idx); }
+    void lock() noexcept { this->lock_ex(base, base + n); }
+    void unlock() noexcept { this->unlock_ex(base, base + n); }
+    bool try_lock() noexcept { return this->trylock_ex(base, base + n); }
 
-    // exclusive lock
-    void lock() noexcept { impl->lock_exclusive(); }
-    void unlock() noexcept { impl->unlock_exclusive(); }
-    bool try_lock() noexcept { return impl->try_lock_exclusive(); }
+    void upgrade() noexcept { this->upgrade_sh(base, base + n, base + id); }
+    // downgrade exclusive lock to shared lock
+    void downgrade() noexcept {
+      this->downgrade_ex(base, base + n, base + id);
+    }
   };
 
-  using mutex_type = worker_mutex;
-
-  /**
-   * @brief Create a mutex object for a thread pool worker
-   *
-   * @details Create an owned mutex object for a worker. All worker_mutex
-   * created by this function will share the same underlying mutex. However this
-   * mutex can be safely used even if the worker is rescheduled to a different
-   * thread.
-   *
-   * @return worker_mutex
-   */
-  auto create_mutex() -> worker_mutex {
-    worker_mutex m;
-    m.impl = impl;
-    m.idx = request_slot();
-    return m;
+  explicit shared_mutex_mgr(unsigned n) noexcept
+      : n(n), next(0), slot(std::make_unique<detail::shmtx_slot[]>(n + 1)) {}
+  mutex_type create() noexcept {
+    return mutex_type(n, next_index(), slot.get());
+  }
+  mutex_type get(unsigned id) const noexcept {
+    return mutex_type(n, id, slot.get());
   }
 };
 

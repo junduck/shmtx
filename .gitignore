@@ -34,5 +34,8 @@
 # vscode files
 .vscode
 
+# Macos junk
+.DS_Store
+
 # cmake build files
-/build
+build*
