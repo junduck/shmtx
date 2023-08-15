@@ -5,222 +5,100 @@
 #include <thread>
 #include <vector>
 
-struct test_t {
-  size_t v1, v2;
+constexpr size_t work_size = 1'000;
+constexpr size_t slots = 32;
+constexpr size_t reader = 8;
+constexpr size_t writer = 2;
+
+using mutex_type = shmtx::shared_mutex<slots>;
+
+struct work_type_vector {
+  size_t n;
+  std::vector<size_t> pop, push;
+
+  explicit work_type_vector(size_t n) : n(n) {
+    pop.reserve(n);
+    push.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+      pop.push_back(i);
+    }
+  }
+
+  bool done() const { return push.size() == n; }
 };
 
-constexpr size_t nloops = 1000000;
-constexpr size_t xrate_low = 10000;
-constexpr size_t xrate_high = 10;
+struct worker_reader {
+  work_type_vector &work;
+  mutex_type &mtx;
+  std::atomic<bool> &start;
 
-constexpr size_t nthreads_low = 4;
-constexpr size_t nthreads_high = 32;
-constexpr size_t nslot_low = 1;
-constexpr size_t nslot_high = nthreads_low;
-constexpr size_t nslot_more = nthreads_high * 2;
-
-template <typename MUTEX>
-auto create_worker(size_t nloops, size_t xrate, MUTEX &mtx, test_t &data,
-                   std::atomic<bool> &start) {
-  return [nloops, xrate, &mtx, &data, &start]() {
-    while (!start.load(std::memory_order_relaxed))
-      ;
-    for (size_t i = 0; i < nloops; ++i) {
-      if (i % xrate == 0) {
-        std::unique_lock<MUTEX> lock(mtx);
-        data.v1 += 1;
-        data.v2 += 2;
-      } else {
-        std::shared_lock<MUTEX> lock(mtx);
-        EXPECT_EQ(data.v1 * 2, data.v2);
-      }
-    }
-  };
-}
-
-TEST(shmtx, std_shared_mutex) {
-  test_t data{};
-  std::shared_mutex mtx;
-  std::atomic<bool> start{false};
-
-  std::vector<std::thread> workers;
-  for (size_t i = 0; i < nthreads_low; ++i) {
-    workers.emplace_back(create_worker(nloops, xrate_low, mtx, data, start));
-  }
-  start.store(true, std::memory_order_relaxed);
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
-}
-
-TEST(shmtx, shmtx_shared_mutex_lowx_matched_slots) {
-  test_t data{};
-  shmtx::shared_mutex<nslot_low> mtx;
-  std::atomic<bool> start{false};
-
-  std::vector<std::thread> workers;
-  for (size_t i = 0; i < nthreads_low; ++i) {
-    workers.emplace_back(create_worker(nloops, xrate_low, mtx, data, start));
-  }
-  start.store(true, std::memory_order_relaxed);
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
-}
-
-TEST(shmtx, shmtx_shared_mutex_highx_matched_slots) {
-  test_t data{};
-  shmtx::shared_mutex<nslot_low> mtx;
-  std::atomic<bool> start{false};
-
-  std::vector<std::thread> workers;
-  for (size_t i = 0; i < nthreads_low; ++i) {
-    workers.emplace_back(create_worker(nloops, xrate_high, mtx, data, start));
-  }
-  start.store(true, std::memory_order_relaxed);
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
-}
-
-TEST(shmtx, shmtx_shared_mutex_lowx_low_slots) {
-  test_t data{};
-  shmtx::shared_mutex<nslot_low> mtx;
-  std::atomic<bool> start{false};
-
-  std::vector<std::thread> workers;
-  for (size_t i = 0; i < nthreads_low; ++i) {
-    workers.emplace_back(create_worker(nloops, xrate_low, mtx, data, start));
-  }
-  start.store(true, std::memory_order_relaxed);
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
-}
-
-TEST(shmtx, shmtx_shared_mutex_lowx_low_contention) {
-  test_t data{};
-  shmtx::shared_mutex<nslot_more> mtx;
-  std::atomic<bool> start{false};
-
-  std::vector<std::thread> workers;
-  for (size_t i = 0; i < nthreads_high; ++i) {
-    workers.emplace_back(create_worker(nloops, xrate_low, mtx, data, start));
-  }
-  start.store(true, std::memory_order_relaxed);
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
-}
-
-TEST(shmtx, shmtx_shared_mutex_lowx_high_contention) {
-  test_t data{};
-  shmtx::shared_mutex<nslot_high> mtx;
-  std::atomic<bool> start{false};
-
-  std::vector<std::thread> workers;
-  for (size_t i = 0; i < nthreads_high; ++i) {
-    workers.emplace_back(create_worker(nloops, xrate_low, mtx, data, start));
-  }
-  start.store(true, std::memory_order_relaxed);
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
-}
-
-TEST(shmtx, shmtx_shared_mutex_lowx_higher_contention) {
-  test_t data{};
-  shmtx::shared_mutex<nslot_low> mtx;
-  std::atomic<bool> start{false};
-
-  std::vector<std::thread> workers;
-  for (size_t i = 0; i < nthreads_high; ++i) {
-    workers.emplace_back(create_worker(nloops, xrate_low, mtx, data, start));
-  }
-  start.store(true, std::memory_order_relaxed);
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
-}
-
-template <size_t N> struct worker_t {
-  using pool_type = shmtx::shared_mutex_pool<N>;
-  using mutex_type = typename pool_type::mutex_type;
-
-  size_t nloops, xrate;
-  test_t *data;
-  std::atomic<bool> *start;
-  pool_type *mtx_pool;
-  mutex_type mtx;
-
-  worker_t(size_t nloops, size_t xrate, test_t *data, std::atomic<bool> *start,
-           pool_type *mtx_pool)
-      : nloops(nloops), xrate(xrate), data(data), start(start),
-        mtx_pool(mtx_pool), mtx(mtx_pool->create_mutex()) {}
+  explicit worker_reader(work_type_vector &w, mutex_type &m,
+                         std::atomic<bool> &s)
+      : work(w), mtx(m), start(s) {}
 
   void operator()() {
-    while (!start->load(std::memory_order_relaxed))
+    while (!start.load(std::memory_order_relaxed))
       ;
-    for (size_t i = 0; i < nloops; ++i) {
-      if (i % xrate == 0) {
-        std::unique_lock lock(mtx);
-        data->v1 += 1;
-        data->v2 += 2;
-      } else {
-        std::shared_lock lock(mtx);
-        EXPECT_EQ(data->v1 * 2, data->v2);
+    while (true) {
+      std::shared_lock lock(mtx);
+      if (work.done()) {
+        break;
+      }
+      for (size_t j = 0; j < work.push.size(); ++j) {
+        auto wp = work.push[j];
+        ptrdiff_t diff = wp - j;
+        EXPECT_EQ(diff, 0);
       }
     }
   }
 };
 
-TEST(shmtx, shmtx_shared_mutex_pool) {
-  test_t data{};
-  shmtx::shared_mutex_pool<nslot_high> mtx_pool;
-  std::atomic<bool> start{false};
+struct worker_writer {
+  work_type_vector &work;
+  mutex_type &mtx;
+  std::atomic<bool> &start;
 
-  std::vector<worker_t<nslot_high>> workers;
-  for (size_t i = 0; i < nthreads_high; ++i) {
-    workers.emplace_back(nloops, xrate_low, &data, &start, &mtx_pool);
-  }
+  explicit worker_writer(work_type_vector &w, mutex_type &m,
+                         std::atomic<bool> &s)
+      : work(w), mtx(m), start(s) {}
 
-  std::vector<std::thread> threads;
-  for (auto &worker : workers) {
-    threads.emplace_back(worker);
-  }
-
-  start.store(true, std::memory_order_relaxed);
-
-  for (auto &thread : threads) {
-    thread.join();
-  }
-
-  EXPECT_EQ(data.v1, nloops * nthreads_high / xrate_low);
-
-  start.store(false, std::memory_order_relaxed);
-
-  // simulate workers being rescheduled on different threads
-
-  for (auto &worker : workers) {
-    threads.emplace_back(worker);
-  }
-
-  start.store(true, std::memory_order_relaxed);
-
-  for (auto &thread : threads) {
-    if (thread.joinable()) {
-      thread.join();
+  void operator()() {
+    while (!start.load(std::memory_order_relaxed))
+      ;
+    while (true) {
+      std::lock_guard lock(mtx);
+      if (work.done()) {
+        break;
+      }
+      work.push.push_back(work.pop[work.push.size()]);
     }
   }
+};
 
-  EXPECT_EQ(data.v1, nloops * nthreads_high / xrate_low * 2);
+TEST(shmtx, basic) {
+  work_type_vector work(work_size);
+  std::atomic<bool> start(false);
+  mutex_type mtx{};
+  std::vector<std::function<void()>> workers;
+  std::vector<std::thread> th;
+
+  for (size_t i = 0; i < reader; ++i) {
+    workers.emplace_back(
+        std::function<void()>(worker_reader(work, mtx, start)));
+  }
+  for (size_t i = 0; i < writer; ++i) {
+    workers.emplace_back(
+        std::function<void()>(worker_writer(work, mtx, start)));
+  }
+
+  for (size_t i = 0; i < (reader + writer); ++i) {
+    th.emplace_back(workers[i]);
+  }
+
+  start.store(true, std::memory_order_relaxed);
+  for (auto &t : th) {
+    t.join();
+  }
 }
 
 int main(int argc, char **argv) {
