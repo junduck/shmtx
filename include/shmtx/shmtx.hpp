@@ -19,7 +19,7 @@
 #endif
 
 #define SHMTX_OS_MACOS 0
-#if defined(__APPLE__) && !defined(TARGET_OS_IOS)
+#if defined(__APPLE__) && !Target_OS_IOS
 #undef SHMTX_OS_MACOS
 #define SHMTX_OS_MACOS 1
 #endif
@@ -109,7 +109,9 @@ struct alignas(arch::cacheline) shmtx_slot {
   void pub(size_t st = 0) noexcept {
     state.store(st, std::memory_order_release);
   }
-  void dec() noexcept { state.fetch_sub(1, std::memory_order_release); }
+  size_t dec() noexcept {
+    return state.fetch_sub(1, std::memory_order_release);
+  }
   bool cas(size_t &observed, size_t desired) noexcept {
     return state.compare_exchange_weak(observed, desired,
                                        std::memory_order_acquire,
@@ -123,8 +125,9 @@ struct alignas(arch::cacheline) shmtx_slot {
 struct shmtx_impl {
   template <typename Iter> static void wlock(Iter slot) noexcept {
     auto retry = 0;
-    while (slot->xchg(1)) // acq
-      arch::spin_relax(retry);
+    while (slot->xchg(1))
+      while (slot->get())
+        arch::spin_relax(retry);
   }
 
   template <typename Iter> static bool try_wlock(Iter slot) noexcept {
@@ -347,9 +350,7 @@ public:
 
     void upgrade() noexcept { this->upgrade_sh(base, base + n, base + id); }
     // downgrade exclusive lock to shared lock
-    void downgrade() noexcept {
-      this->downgrade_ex(base, base + n, base + id);
-    }
+    void downgrade() noexcept { this->downgrade_ex(base, base + n, base + id); }
   };
 
   explicit shared_mutex_mgr(unsigned n) noexcept
