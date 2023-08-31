@@ -435,4 +435,104 @@ public:
   }
 };
 
+struct adopt_shared_t {};
+constexpr inline adopt_shared_t adopt_shared{};
+struct adopt_lock_t {};
+constexpr inline adopt_lock_t adopt_lock{};
+struct try_shared_t {};
+constexpr inline try_shared_t try_shared{};
+struct try_lock_t {};
+constexpr inline try_lock_t try_lock{};
+struct acq_shared_t {};
+constexpr inline acq_shared_t acq_shared{};
+struct acq_lock_t {};
+constexpr inline acq_lock_t acq_lock{};
+
+template <typename Mutex>
+class upgrade_lock final {
+  Mutex &m;
+  enum State { unlocked,
+               shared,
+               locked,
+               released } state;
+
+public:
+  upgrade_lock(Mutex &m) noexcept : m(m), state(unlocked) {}
+  upgrade_lock(Mutex &m, adopt_shared_t) noexcept : m(m), state(shared) {}
+  upgrade_lock(Mutex &m, adopt_lock_t) noexcept : m(m), state(locked) {}
+  upgrade_lock(Mutex &m, try_shared_t) noexcept : m(m), state(m.try_lock_shared() ? shared : unlocked) {}
+  upgrade_lock(Mutex &m, try_lock_t) noexcept : m(m), state(m.try_lock() ? locked : unlocked) {}
+  upgrade_lock(Mutex &m, acq_shared_t) noexcept : m(m), state(shared) { m.lock_shared(); }
+  upgrade_lock(Mutex &m, acq_lock_t) noexcept : m(m), state(locked) { m.lock(); }
+
+  upgrade_lock(const upgrade_lock &) = delete;
+  upgrade_lock(upgrade_lock &&) = delete;
+  upgrade_lock &operator=(const upgrade_lock &) = delete;
+  upgrade_lock &operator=(upgrade_lock &&) = delete;
+
+  ~upgrade_lock() noexcept {
+    switch (state) {
+    case released:
+    case unlocked:
+      break;
+    case shared:
+      m.unlock_shared();
+      break;
+    case locked:
+      m.unlock();
+      break;
+    }
+  }
+
+  bool owns_shared() const noexcept { return state == shared; }
+  bool owns_lock() const noexcept { return state == locked; }
+
+  void upgrade() noexcept {
+    switch (state) {
+    case unlocked:
+      m.lock_shared();
+      state = shared;
+      break;
+    case shared:
+      m.upgrade();
+      state = locked;
+      break;
+    case released:
+    case locked:
+      break;
+    }
+  }
+
+  void downgrade() noexcept {
+    switch (state) {
+    case released:
+    case unlocked:
+      break;
+    case shared:
+      m.unlock_shared();
+      state = unlocked;
+      break;
+    case locked:
+      m.downgrade();
+      state = shared;
+      break;
+    }
+  }
+
+  // release the mutex. essentially makes the lock no-op
+  void release() noexcept {
+    state = released;
+  }
+
+  class [[nodiscard]] scope_upgrade_t {
+    upgrade_lock *self;
+    friend class upgrade_lock;
+    scope_upgrade_t(upgrade_lock *self) noexcept : self{self} { self->upgrade(); }
+
+  public:
+    ~scope_upgrade_t() noexcept { self->downgrade(); }
+  };
+  scope_upgrade_t scope_upgrade() noexcept { return {this}; }
+};
+
 } // namespace shmtx
