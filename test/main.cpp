@@ -5,7 +5,7 @@
 #include <thread>
 #include <vector>
 
-constexpr size_t work_size = 1'000;
+constexpr size_t work_size = 50'000;
 constexpr size_t slots = 32;
 constexpr size_t reader = 8;
 constexpr size_t writer = 2;

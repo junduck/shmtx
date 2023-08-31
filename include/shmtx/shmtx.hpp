@@ -53,9 +53,15 @@ namespace arch {
 inline void spin_pause() { _mm_pause(); }
 #elif SHMTX_ARCH_ARM
 #if SHMTX_COMP_GCC
-inline void spin_pause() { asm volatile("yield" ::: "memory"); }
+inline void spin_pause() {
+  asm volatile("yield" ::: "memory");}
+  //asm volatile("sevl; wfe" ::: "memory");
 #else
-inline void spin_pause() { __yield(); }
+inline void spin_pause() {
+  __yield();
+  //__sevl();
+  //__wfe();
+}
 #endif
 #else
 inline void spin_pause() {}
@@ -210,10 +216,10 @@ struct shmtx_impl {
   template <typename Iter>
   static void upgrade_sh(Iter first, Iter last, Iter hold) noexcept {
     wlock(last);
-    unlock_sh(hold);
     for (auto slot = first; slot != last; ++slot) {
       slot->write_enter();
     }
+    unlock_sh(hold);
     auto retry = 0;
     for (auto slot = first; slot != last; ++slot) {
       while (slot->acq() != shmtx_slot::write) {
@@ -255,6 +261,7 @@ struct shmtx_impl {
           (slot != hold && state != shmtx_slot::write))
         return false;
     }
+    unlock_sh(hold);
     return true;
   }
 
