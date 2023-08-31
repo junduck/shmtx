@@ -19,7 +19,7 @@
 #endif
 
 #define SHMTX_OS_MACOS 0
-#if defined(__APPLE__) && !Target_OS_IOS
+#if defined(__APPLE__)
 #undef SHMTX_OS_MACOS
 #define SHMTX_OS_MACOS 1
 #endif
@@ -287,7 +287,7 @@ struct shmtx_impl {
  *
  * @tparam N number of slots to reduce contention
  */
-template <size_t N> class shared_mutex : private detail::shmtx_impl {
+template <size_t N> class shared_mutex final : private detail::shmtx_impl {
   std::array<detail::shmtx_slot, N + 1> slots{};
   static std::atomic<size_t> nthread;
   // this thread's slot index
@@ -356,7 +356,6 @@ public:
     bool try_lock() noexcept { return this->trylock_ex(base, base + n); }
 
     void upgrade() noexcept { this->upgrade_sh(base, base + n, base + id); }
-    // downgrade exclusive lock to shared lock
     void downgrade() noexcept { this->downgrade_ex(base, base + n, base + id); }
   };
 
@@ -367,6 +366,72 @@ public:
   }
   mutex_type get(unsigned id) const noexcept {
     return mutex_type(n, id, slot.get());
+  }
+};
+
+class spsc_mutex final {
+  using slot_t = detail::shmtx_slot;
+  slot_t slot;
+
+public:
+  void lock_shared() noexcept {
+    auto retry = 0;
+    while (true) {
+      auto state = slot.get();
+      if (state & slot_t::write) {
+        arch::spin_relax(retry);
+      } else if (slot.cas(state, state + 1)) {
+        break;
+      }
+    }
+  }
+
+  void unlock_shared() noexcept {
+    slot.dec();
+  }
+
+  bool trylock_shared() noexcept {
+    auto state = slot.get();
+    if (state & slot_t::write) {
+      return false;
+    } else {
+      return slot.cas(state, state + 1);
+    }
+  }
+
+  void lock() noexcept {
+    slot.write_enter();
+    auto retry = 0;
+    while (slot.acq() != slot_t::write) {
+      arch::spin_relax(retry);
+    }
+  }
+
+  void unlock() noexcept {
+    slot.pub(0);
+  }
+
+  bool try_lock() noexcept {
+    slot.write_enter();
+    if (slot.acq() != slot_t::write) {
+      slot.write_leave();
+      return false;
+    } else {
+      return true;
+    }
+  }
+
+  void upgrade() noexcept {
+    slot.write_enter();
+    slot.dec();
+    auto retry = 0;
+    while (slot.acq() != slot_t::write) {
+      arch::spin_relax(retry);
+    }
+  }
+
+  void downgrade() noexcept {
+    slot.pub(1);
   }
 };
 
